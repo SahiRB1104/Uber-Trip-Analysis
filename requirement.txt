@@ -1,7 +1,7 @@
-streamlit
+streamlit>=1.25.0
 pandas
 numpy
 plotly
+matplotlib
 pydeck
 altair
-matplotlib
