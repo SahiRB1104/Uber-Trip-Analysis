@@ -2,7 +2,8 @@ streamlit>=1.25.0
 pandas
 numpy
 plotly
-matplotlib
-pydeck
-altair
 scikit-learn
+prophet
+matplotlib
+altair
+pydeck
