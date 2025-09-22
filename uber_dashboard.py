@@ -3,10 +3,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.linear_model import LinearRegression
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVR
+from sklearn.metrics import mean_absolute_error
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import root_mean_squared_error
 from sklearn.metrics import r2_score
 from prophet import Prophet
@@ -22,6 +29,9 @@ st.markdown("""
     .metric-card { background-color: #f0f2f6; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 15px; }
     .metric-value { font-size: 32px; font-weight: bold; }
     .metric-label { font-size: 14px; color: #555; }
+    .top-control { position: sticky; top: 0; z-index: 1000; padding-top: 6px; }
+    :fullscreen .top-control { display: none; }
+    :-webkit-full-screen .top-control { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -32,6 +42,17 @@ def load_data():
     
     df['START_DATE'] = pd.to_datetime(df['START_DATE'], errors='coerce')
     df['END_DATE'] = pd.to_datetime(df['END_DATE'], errors='coerce')
+    # Shift dataset dates so that the most recent trip aligns with today's date
+    try:
+        latest_date = df['START_DATE'].max()
+        if pd.notna(latest_date):
+            today = pd.Timestamp.today().normalize()
+            offset_days = (today - latest_date.normalize()).days
+            if offset_days != 0:
+                df['START_DATE'] = df['START_DATE'] + pd.to_timedelta(offset_days, unit='D')
+                df['END_DATE'] = df['END_DATE'] + pd.to_timedelta(offset_days, unit='D')
+    except Exception:
+        pass
     df['Duration(min)'] = (df['END_DATE'] - df['START_DATE']).dt.total_seconds() / 60
     df['Date'] = df['START_DATE'].dt.date
     df['Hour'] = df['START_DATE'].dt.hour
@@ -48,9 +69,16 @@ def load_data():
     return df
 
 df = load_data()
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
+st.markdown("<div class='top-control'></div>", unsafe_allow_html=True)
+_spacer, _refresh_col = st.columns([0.85, 0.15])
+with _refresh_col:
+    if st.button("🔄 Refresh Data", use_container_width=True, key="refresh_top"):
+        st.cache_data.clear()
+        st.rerun()
+# if st.button("🔄 Refresh Data"):
+#     st.cache_data.clear()
+#     st.rerun()
+
 
 # --- Check Missing Values Section ---
 with st.expander("🔍 Check Missing Values"):
@@ -124,11 +152,12 @@ with col3:
 
 
 # ---------------------- TAB LAYOUT ----------------------
-tab1, tab2, tab3, tab4, = st.tabs([
+tab1, tab2, tab3, tab4, tab7 = st.tabs([
     "\U0001F4CA Trip Duration & Features",
     "\U0001F52E Predict Future Trips",
     "\U0001F916 ML insights",
     "\U0001F4BB ML models",
+    "\U0001F50D Route Advisor (RAG)",
 ])
 
 
@@ -201,7 +230,6 @@ with tab2:
     fig = px.line(forecast_result, x='Date', y='Predicted Trips', title="Forecast of Uber Trips")
     st.plotly_chart(fig, use_container_width=True)
 
-    
 
 
 # --- Tab 3: Visual Insights ---
@@ -276,3 +304,58 @@ with tab4:
         st.markdown("#### R² Score Comparison")
         fig_r2 = px.bar(metric_df, x='Model', y='R2 Score', color='Model', text_auto='.2s')
         st.plotly_chart(fig_r2, use_container_width=True)
+
+
+
+
+
+## RNN tab removed per request
+# --- Tab 7: Route Advisor (RAG) ---
+with tab7:
+    # Title and description
+    st.markdown("<h2 class='sub-header'>🔍 Route Advisor (Similarity-based Retrieval)</h2>", unsafe_allow_html=True)
+    st.info("Use case: Given a planned route, retrieve comparable historical trips to estimate ETA and distance and pick better departure times based on evidence.")
+
+    # Build text corpus
+    df_rag = filtered_df.copy()
+    if df_rag.empty:
+        st.warning("No trips available under current filters.")
+    else:
+        # Combine text fields for semantic retrieval
+        def route_text(row):
+            s = str(row.get('START', ''))
+            t = str(row.get('STOP', ''))
+            p = str(row.get('PURPOSE', ''))
+            c = str(row.get('CATEGORY', ''))
+            return f"from {s} to {t} purpose {p} category {c}"
+
+        df_rag['route_text'] = df_rag.apply(route_text, axis=1)
+        # Convert miles to kilometers for display/analytics specific to RAG feature
+        if 'MILES' in df_rag.columns:
+            df_rag['KM'] = pd.to_numeric(df_rag['MILES'], errors='coerce') * 1.60934
+
+        # Simple selection UI: Start and Stop dropdowns from dataset
+        st.markdown("### Select Route")
+        unique_starts = sorted(df_rag['START'].dropna().unique()) if 'START' in df_rag else []
+        unique_stops = sorted(df_rag['STOP'].dropna().unique()) if 'STOP' in df_rag else []
+        scol1, scol2 = st.columns(2)
+        with scol1:
+            sel_start = st.selectbox("Start", options=unique_starts)
+        with scol2:
+            sel_stop = st.selectbox("Stop", options=unique_stops)
+
+        # Filter trips exactly matching selected start and stop
+        if sel_start and sel_stop:
+            trips = df_rag[(df_rag['START'] == sel_start) & (df_rag['STOP'] == sel_stop)].copy()
+            st.subheader("Trips from Start to Stop")
+            if trips.empty:
+                st.info("No trips found for the selected route.")
+            else:
+                # Ensure identifier column: prefer 'ID', else create RowID from original index
+                id_col = 'ID' if 'ID' in trips.columns else None
+                if id_col is None:
+                    trips = trips.reset_index().rename(columns={'index': 'RowID'})
+                    id_col = 'RowID'
+                # Show duration in hours
+                cols_show = [c for c in [id_col, 'START', 'STOP', 'Duration(hrs)'] if c in trips.columns]
+                st.dataframe(trips[cols_show])
